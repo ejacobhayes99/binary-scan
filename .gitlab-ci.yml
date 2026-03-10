@@ -10,12 +10,15 @@ stages:
   - report
   - policy-gate
 
+workflow:
+  rules:
+    - if: $BINARY_REF
+    - when: never
+
 variables:
   BINARY_REF:
     description: "Binary to scan. Accepts: HTTPS URL, GitLab package shorthand (project-id:package:version:filename), or filesystem path (starts with /)"
-  DEFECTDOJO_PRODUCT_TYPE:
-    value: "Research and Development"
-    description: "DefectDojo product type for grouping products"
+  DEFECTDOJO_PRODUCT_TYPE: "Research and Development"
   DEFECTDOJO_URL: "http://defectdojo-docker-nginx-1:8080"
   DEPENDENCY_TRACK_URL: "http://dtrack-apiserver:8080"
 
@@ -82,19 +85,27 @@ syft-binary-sbom:
       COMPONENT_COUNT=$(jq '.components | length' sbom.cdx.json)
       echo "SBOM generated — ${COMPONENT_COUNT} components detected"
       echo "{\"component_count\": ${COMPONENT_COUNT}}" > sbom-meta.json
+      echo "SBOM_COMPONENT_COUNT=${COMPONENT_COUNT}" > sbom.env
     - |
-      curl -sS -X POST "${DEPENDENCY_TRACK_URL}/api/v1/bom" \
-        -H "X-Api-Key: ${DT_API_TOKEN}" \
-        -F "autoCreate=true" \
-        -F "projectName=${SCAN_PRODUCT_NAME}" \
-        -F "projectVersion=${SCAN_TAG}" \
-        -F "bom=@sbom.cdx.json" \
-        | tee dt-upload-response.json
+      if [ "$(jq '.components | length' sbom.cdx.json)" -eq 0 ]; then
+        echo "Skipping Dependency Track upload — 0 components"
+        echo '{}' > dt-upload-response.json
+      else
+        curl -sS -X POST "${DEPENDENCY_TRACK_URL}/api/v1/bom" \
+          -H "X-Api-Key: ${DT_API_TOKEN}" \
+          -F "autoCreate=true" \
+          -F "projectName=${SCAN_PRODUCT_NAME}" \
+          -F "projectVersion=${SCAN_TAG}" \
+          -F "bom=@sbom.cdx.json" \
+          | tee dt-upload-response.json
+      fi
   artifacts:
     paths:
       - sbom.cdx.json
       - sbom-meta.json
       - dt-upload-response.json
+    reports:
+      dotenv: sbom.env
     when: always
     expire_in: 30 days
 
@@ -141,6 +152,8 @@ sync-dt-to-defectdojo:
   image:
     name: ghcr.io/aquasecurity/trivy:latest
     entrypoint: [""]
+  rules:
+    - if: $SBOM_COMPONENT_COUNT != "0"
   needs:
     - job: parse-binary-ref
       artifacts: true

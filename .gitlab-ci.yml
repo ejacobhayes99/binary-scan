@@ -98,6 +98,22 @@ syft-binary-sbom:
     when: always
     expire_in: 30 days
 
+sbom-coverage-check:
+  stage: scan
+  image: python:3.11-alpine
+  needs:
+    - job: syft-binary-sbom
+      artifacts: true
+    - job: parse-binary-ref
+      artifacts: true
+  script:
+    - python scripts/sbom-coverage-to-dd.py --input sbom.cdx.json --output dd-sbom-coverage.json
+  artifacts:
+    paths:
+      - dd-sbom-coverage.json
+    expire_in: 7 days
+    when: always
+
 # ------------------------------------------
 # Stage: Upload
 # ------------------------------------------
@@ -244,6 +260,45 @@ sync-dt-to-defectdojo:
     expire_in: 7 days
 
 # ------------------------------------------
+# Coverage summary: aggregate scan signals
+# into a single DefectDojo finding
+# ------------------------------------------
+coverage-summary:
+  stage: upload
+  image: python:3.11-alpine
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+    - job: trivy-binary-scan
+      artifacts: true
+    - job: sbom-coverage-check
+      artifacts: true
+  before_script:
+    - apk add --no-cache file
+  script:
+    - python scripts/coverage-summary.py
+        --trivy-results trivy-results.json
+        --sbom-coverage dd-sbom-coverage.json
+        --scan-target-dir "$SCAN_TARGET_DIR"
+        --output dd-coverage-summary.json
+  artifacts:
+    paths:
+      - dd-coverage-summary.json
+    expire_in: 7 days
+    when: always
+
+upload-coverage-summary:
+  extends: .dd-reimport
+  variables:
+    SCAN_TYPE: "Generic Findings Import"
+    SCAN_FILE: "dd-coverage-summary.json"
+  needs:
+    - job: coverage-summary
+      artifacts: true
+    - job: parse-binary-ref
+      artifacts: true
+
+# ------------------------------------------
 # Stage: Report (extends shared templates)
 # ------------------------------------------
 export-findings:
@@ -285,3 +340,4 @@ policy-gate:
     - job: parse-binary-ref
       artifacts: true
     - job: enrich-epss
+    - job: upload-coverage-summary

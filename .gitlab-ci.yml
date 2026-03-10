@@ -1,0 +1,288 @@
+include:
+  - project: 'develop/templates'
+    ref: main
+    file: 'ci/shared.yml'
+
+stages:
+  - init
+  - scan
+  - upload
+  - report
+  - policy-gate
+
+variables:
+  BINARY_REF:
+    value: ""
+    description: "Binary to scan. Accepts: HTTPS URL, GitLab package shorthand (project-id:package:version:filename), or filesystem path (starts with /)"
+  DEFECTDOJO_PRODUCT_TYPE:
+    value: "Research and Development"
+    description: "DefectDojo product type for grouping products"
+  DEFECTDOJO_URL: "http://defectdojo-docker-nginx-1:8080"
+  DEPENDENCY_TRACK_URL: "http://dtrack-apiserver:8080"
+
+# ------------------------------------------
+# Setup: parse BINARY_REF, download/unpack,
+# write dotenv for all downstream jobs.
+# ------------------------------------------
+parse-binary-ref:
+  stage: init
+  image: alpine:3.21
+  script:
+    - chmod +x scripts/parse-binary-ref.sh
+    - scripts/parse-binary-ref.sh
+  artifacts:
+    reports:
+      dotenv: scan.env
+    paths:
+      - scan-workspace/unpacked/
+    expire_in: 30 days
+
+# ------------------------------------------
+# Stage: Scan
+# ------------------------------------------
+trivy-binary-scan:
+  stage: scan
+  image:
+    name: ghcr.io/aquasecurity/trivy:latest
+    entrypoint: [""]
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+  variables:
+    TRIVY_FORMAT: json
+    TRIVY_OUTPUT: trivy-results.json
+  script:
+    - echo "Scan target directory:${SCAN_TARGET_DIR}"
+    - ls -lhR "${SCAN_TARGET_DIR}"
+    - trivy rootfs --format table "${SCAN_TARGET_DIR}"
+    - trivy rootfs --format json --output trivy-results.json "${SCAN_TARGET_DIR}"
+    - |
+      VULN_COUNT=$(grep -c '"VulnerabilityID"' trivy-results.json 2>/dev/null || echo "0")
+      echo "Trivy scan complete — ${VULN_COUNT} vulnerability entries found"
+  after_script:
+    - rm -rf /root/.cache/trivy 2>/dev/null || true
+  artifacts:
+    paths:
+      - trivy-results.json
+    when: always
+    expire_in: 30 days
+
+syft-binary-sbom:
+  stage: scan
+  image: alpine:3.21
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl bash jq
+  script:
+    - curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+    - syft dir:"${SCAN_TARGET_DIR}" -o cyclonedx-json=sbom.cdx.json
+    - rm -rf /tmp/syft-* /root/.cache/syft 2>/dev/null || true
+    - |
+      COMPONENT_COUNT=$(jq '.components | length' sbom.cdx.json)
+      echo "SBOM generated — ${COMPONENT_COUNT} components detected"
+      echo "{\"component_count\": ${COMPONENT_COUNT}}" > sbom-meta.json
+    - |
+      curl -sS -X POST "${DEPENDENCY_TRACK_URL}/api/v1/bom" \
+        -H "X-Api-Key: ${DT_API_TOKEN}" \
+        -F "autoCreate=true" \
+        -F "projectName=${SCAN_PRODUCT_NAME}" \
+        -F "projectVersion=${SCAN_TAG}" \
+        -F "bom=@sbom.cdx.json" \
+        | tee dt-upload-response.json
+  artifacts:
+    paths:
+      - sbom.cdx.json
+      - sbom-meta.json
+      - dt-upload-response.json
+    when: always
+    expire_in: 30 days
+
+# ------------------------------------------
+# Stage: Upload
+# ------------------------------------------
+upload-trivy:
+  extends: .dd-reimport
+  variables:
+    SCAN_TYPE: "Trivy Scan"
+    SCAN_FILE: "trivy-results.json"
+    SCAN_RESPONSE_FILE: "import-response.json"
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+    - job: trivy-binary-scan
+      artifacts: true
+  artifacts:
+    paths:
+      - import-response.json
+
+# ------------------------------------------
+# Sync DT findings to DefectDojo (custom --
+# not templated due to DT polling complexity)
+# ------------------------------------------
+sync-dt-to-defectdojo:
+  stage: upload
+  image:
+    name: ghcr.io/aquasecurity/trivy:latest
+    entrypoint: [""]
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+    - job: syft-binary-sbom
+      artifacts: true
+  variables:
+    POLL_INTERVAL: "5"
+    POLL_MAX_ATTEMPTS: "60"
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    # Extract the BOM processing token
+    - |
+      BOM_TOKEN=$(jq -r '.token' dt-upload-response.json)
+      if [ -z "$BOM_TOKEN" ] || [ "$BOM_TOKEN" = "null" ]; then
+        echo "ERROR: No BOM token found in dt-upload-response.json"
+        cat dt-upload-response.json
+        exit 1
+      fi
+      echo "BOM processing token: ${BOM_TOKEN}"
+
+    # Poll DT until BOM processing is complete
+    - |
+      echo "Waiting for Dependency Track to finish processing..."
+      ATTEMPT=0
+      while [ "$ATTEMPT" -lt "$POLL_MAX_ATTEMPTS" ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        PROCESSING=$(curl -sS -H "X-Api-Key: ${DT_API_TOKEN}" \
+          "${DEPENDENCY_TRACK_URL}/api/v1/bom/token/${BOM_TOKEN}" \
+          | jq -r '.processing')
+
+        if [ "$PROCESSING" = "false" ]; then
+          echo "BOM processing complete (after ${ATTEMPT} polls)"
+          break
+        fi
+
+        echo "  Poll ${ATTEMPT}/${POLL_MAX_ATTEMPTS} — still processing..."
+        sleep "$POLL_INTERVAL"
+      done
+
+      if [ "$PROCESSING" != "false" ]; then
+        echo "ERROR: Timed out waiting for BOM processing after $((POLL_MAX_ATTEMPTS * POLL_INTERVAL))s"
+        exit 1
+      fi
+
+    # Look up the DT project UUID by name and version
+    - |
+      PROJECT_UUID=$(curl -sS -H "X-Api-Key: ${DT_API_TOKEN}" \
+        "${DEPENDENCY_TRACK_URL}/api/v1/project/lookup?name=${SCAN_PRODUCT_NAME}&version=${SCAN_TAG}" \
+        | jq -r '.uuid')
+      if [ -z "$PROJECT_UUID" ] || [ "$PROJECT_UUID" = "null" ]; then
+        echo "ERROR: Could not find DT project '${SCAN_PRODUCT_NAME}:${SCAN_TAG}'"
+        exit 1
+      fi
+      echo "DT project UUID: ${PROJECT_UUID}"
+
+    # Wait for vulnerability analysis to complete
+    - |
+      echo "Waiting for vulnerability analysis to complete..."
+      ATTEMPT=0
+      FINDING_COUNT=0
+      while [ "$ATTEMPT" -lt "$POLL_MAX_ATTEMPTS" ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+
+        FINDING_COUNT=$(curl -sS -o /dev/null -w '' \
+          -H "X-Api-Key: ${DT_API_TOKEN}" \
+          -D - \
+          "${DEPENDENCY_TRACK_URL}/api/v1/finding/project/${PROJECT_UUID}" \
+          | grep -i '^X-Total-Count:' | tr -d '\r' | awk '{print $2}')
+
+        if [ -n "$FINDING_COUNT" ] && [ "$FINDING_COUNT" -gt 0 ] 2>/dev/null; then
+          echo "Vulnerability analysis complete — ${FINDING_COUNT} findings (after ${ATTEMPT} polls)"
+          break
+        fi
+
+        echo "  Poll ${ATTEMPT}/${POLL_MAX_ATTEMPTS} — no findings yet..."
+        sleep "$POLL_INTERVAL"
+      done
+
+      if [ -z "$FINDING_COUNT" ] || [ "$FINDING_COUNT" -eq 0 ] 2>/dev/null; then
+        echo "WARNING: No findings after $((POLL_MAX_ATTEMPTS * POLL_INTERVAL))s — exporting anyway"
+      fi
+
+    # Export findings from DT in FPF format
+    - |
+      curl -sS -H "X-Api-Key: ${DT_API_TOKEN}" \
+        "${DEPENDENCY_TRACK_URL}/api/v1/finding/project/${PROJECT_UUID}/export" \
+        -o dt-findings-fpf.json
+      echo "Exported FPF file ($(wc -c < dt-findings-fpf.json) bytes)"
+
+      if [ ! -s dt-findings-fpf.json ]; then
+        echo "ERROR: FPF export is empty — DT may lack VIEW_VULNERABILITY permission"
+        exit 1
+      fi
+
+    # Upload FPF findings to DefectDojo
+    - |
+      ENGAGEMENT="${SCAN_ENGAGEMENT_PREFIX} - ${SCAN_TAG}"
+      curl -sS -X POST "${DEFECTDOJO_URL}/api/v2/reimport-scan/" \
+        -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+        -F "scan_type=Dependency Track Finding Packaging Format (FPF) Export" \
+        -F "file=@dt-findings-fpf.json" \
+        -F "product_name=${SCAN_PRODUCT_NAME}" \
+        -F "product_type_name=${DEFECTDOJO_PRODUCT_TYPE}" \
+        -F "engagement_name=${ENGAGEMENT}" \
+        -F "version=${SCAN_TAG}" \
+        -F "auto_create_context=true" \
+        -F "close_old_findings=true" \
+        -F "active=true" \
+        -F "verified=true" \
+        | tee dt-defectdojo-import-response.json
+  artifacts:
+    paths:
+      - dt-findings-fpf.json
+      - dt-defectdojo-import-response.json
+    when: always
+    expire_in: 7 days
+
+# ------------------------------------------
+# Stage: Report (extends shared templates)
+# ------------------------------------------
+export-findings:
+  extends: .export-findings
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+    - job: upload-trivy
+      artifacts: false
+
+generate-report:
+  extends: .generate-report
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+    - job: upload-trivy
+      artifacts: true
+
+enrich-epss:
+  extends: .enrich-epss
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+    - job: upload-trivy
+
+enrich-kev:
+  extends: .enrich-kev
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+    - job: upload-trivy
+
+# ------------------------------------------
+# Stage: Policy Gate (extends shared template)
+# ------------------------------------------
+policy-gate:
+  extends: .policy-gate
+  needs:
+    - job: parse-binary-ref
+      artifacts: true
+    - job: enrich-epss

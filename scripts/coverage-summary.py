@@ -111,6 +111,7 @@ SCANNABLE_MIMES = {
     "application/java-archive",
     "application/x-mach-binary",
     "application/x-dosexec",
+    "application/vnd.microsoft.portable-executable",
     "application/zip",
 }
 

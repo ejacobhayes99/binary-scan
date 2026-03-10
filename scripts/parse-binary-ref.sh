@@ -8,7 +8,7 @@ set -euo pipefail
 # unpack archives, and write scan.env dotenv.
 # ──────────────────────────────────────────────
 
-apk add --no-cache file unzip tar coreutils
+apk add --no-cache file unzip tar coreutils msitools cabextract
 
 WORKSPACE="${CI_PROJECT_DIR}/scan-workspace"
 DOWNLOAD_PATH="${WORKSPACE}/artifact.download"
@@ -105,6 +105,20 @@ case "${MIME_TYPE}" in
       exit 1
     fi
     tar xJf "${DOWNLOAD_PATH}" -C "${UNPACK_DIR}"
+    ;;
+  application/x-msi|application/x-ole-storage|application/vnd.ms-msi)
+    printf '[binary-scan:init] Extracting MSI with msiextract...\n'
+    msiextract -C "${UNPACK_DIR}" "${DOWNLOAD_PATH}" || {
+      printf '[binary-scan:init] WARN: msiextract failed, keeping raw MSI\n'
+      mv "${DOWNLOAD_PATH}" "${UNPACK_DIR}/"
+    }
+    ;;
+  application/vnd.ms-cab-compressed)
+    printf '[binary-scan:init] Extracting CAB with cabextract...\n'
+    cabextract -d "${UNPACK_DIR}" "${DOWNLOAD_PATH}" || {
+      printf '[binary-scan:init] WARN: cabextract failed, keeping raw CAB\n'
+      mv "${DOWNLOAD_PATH}" "${UNPACK_DIR}/"
+    }
     ;;
   *)
     # Single binary — move into unpacked directory

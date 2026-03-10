@@ -8,7 +8,7 @@ set -euo pipefail
 # unpack archives, and write scan.env dotenv.
 # ──────────────────────────────────────────────
 
-apk add --no-cache file unzip tar coreutils msitools cabextract
+apk add --no-cache file unzip tar coreutils msitools cabextract rpm2cpio dpkg squashfs-tools
 
 WORKSPACE="${CI_PROJECT_DIR}/scan-workspace"
 DOWNLOAD_PATH="${WORKSPACE}/artifact.download"
@@ -120,6 +120,27 @@ case "${MIME_TYPE}" in
       mv "${DOWNLOAD_PATH}" "${UNPACK_DIR}/"
     }
     ;;
+  application/vnd.debian.binary-package|application/x-archive)
+    printf '[binary-scan:init] Extracting DEB with dpkg-deb...\n'
+    dpkg-deb -x "${DOWNLOAD_PATH}" "${UNPACK_DIR}" || {
+      printf '[binary-scan:init] WARN: dpkg-deb failed, keeping raw file\n'
+      mv "${DOWNLOAD_PATH}" "${UNPACK_DIR}/"
+    }
+    ;;
+  application/x-rpm)
+    printf '[binary-scan:init] Extracting RPM with rpm2cpio...\n'
+    (cd "${UNPACK_DIR}" && rpm2cpio "${DOWNLOAD_PATH}" | cpio -idm) || {
+      printf '[binary-scan:init] WARN: rpm2cpio failed, keeping raw RPM\n'
+      mv "${DOWNLOAD_PATH}" "${UNPACK_DIR}/"
+    }
+    ;;
+  application/x-squashfs)
+    printf '[binary-scan:init] Extracting SquashFS (AppImage/Snap)...\n'
+    unsquashfs -d "${UNPACK_DIR}/squashfs-root" "${DOWNLOAD_PATH}" || {
+      printf '[binary-scan:init] WARN: unsquashfs failed, keeping raw file\n'
+      mv "${DOWNLOAD_PATH}" "${UNPACK_DIR}/"
+    }
+    ;;
   *)
     # Single binary — move into unpacked directory
     mv "${DOWNLOAD_PATH}" "${UNPACK_DIR}/"
@@ -163,7 +184,7 @@ STRIPPED="${RAW_FILENAME}"
 STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.tar\.gz$//')
 STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.tar\.xz$//')
 STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.tar\.bz2$//')
-STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.\(zip\|gz\|xz\|bz2\|jar\|war\|ear\|bin\|exe\|elf\|so\|dll\|deb\|rpm\|apk\|msi\)$//')
+STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.\(zip\|gz\|xz\|bz2\|jar\|war\|ear\|bin\|exe\|elf\|so\|dll\|deb\|rpm\|apk\|msi\|cab\|dmg\|pkg\|snap\|appimage\)$/I')
 
 # Extract version — try URL path first (covers GitHub/GitLab releases
 # and most CDN layouts), then fall back to filename

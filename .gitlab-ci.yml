@@ -12,7 +12,6 @@ stages:
 
 variables:
   BINARY_REF:
-    value: ""
     description: "Binary to scan. Accepts: HTTPS URL, GitLab package shorthand (project-id:package:version:filename), or filesystem path (starts with /)"
   DEFECTDOJO_PRODUCT_TYPE:
     value: "Research and Development"

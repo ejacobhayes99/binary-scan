@@ -151,10 +151,27 @@ STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.tar\.xz$//')
 STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.tar\.bz2$//')
 STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.\(zip\|gz\|xz\|bz2\|jar\|war\|ear\|bin\|exe\|elf\|so\|dll\|deb\|rpm\|apk\|msi\)$//')
 
-# Extract version from stripped name (semver-like patterns)
-# Matches: v1.2.3, 1.2.3, 1.2, v1.2
+# Extract version — try URL path first (covers GitHub/GitLab releases
+# and most CDN layouts), then fall back to filename
 VERSION_PATTERN='v?[0-9]+\.[0-9]+(\.[0-9]+)?'
-SCAN_TAG=$(printf '%s' "${STRIPPED}" | grep -oE "${VERSION_PATTERN}" | head -1 || true)
+SCAN_TAG=""
+
+# For URLs, scan the path (excluding the filename) for a version segment
+if printf '%s' "${BINARY_REF}" | grep -qE '^https://'; then
+  # Strip query string, then filename, leaving the directory path
+  URL_PATH=$(printf '%s' "${BINARY_REF}" | sed 's|?.*||' | sed 's|/[^/]*$||')
+  # GitHub/GitLab releases: .../releases/download/v1.2.3/filename
+  # Generic: any path segment that is purely a version (e.g., /v4.44.6/)
+  SCAN_TAG=$(printf '%s' "${URL_PATH}" | grep -oE '(^|/)v?[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's|^/||' | tail -1 || true)
+  if [ -n "${SCAN_TAG}" ]; then
+    printf '[binary-scan:init] Version extracted from URL path: %s\n' "${SCAN_TAG}"
+  fi
+fi
+
+# Fall back to extracting version from the filename
+if [ -z "${SCAN_TAG}" ]; then
+  SCAN_TAG=$(printf '%s' "${STRIPPED}" | grep -oE "${VERSION_PATTERN}" | head -1 || true)
+fi
 
 # Derive product name: strip from the first version match onward,
 # then strip trailing separators and platform suffixes

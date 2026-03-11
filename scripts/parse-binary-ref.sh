@@ -184,7 +184,7 @@ STRIPPED="${RAW_FILENAME}"
 STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.tar\.gz$//')
 STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.tar\.xz$//')
 STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.tar\.bz2$//')
-STRIPPED=$(printf '%s' "${STRIPPED}" | sed 's/\.\(zip\|gz\|xz\|bz2\|jar\|war\|ear\|bin\|exe\|elf\|so\|dll\|deb\|rpm\|apk\|msi\|cab\|dmg\|pkg\|snap\|appimage\)$/I')
+STRIPPED=$(printf '%s' "${STRIPPED}" | sed -E 's/\.(zip|gz|xz|bz2|jar|war|ear|bin|exe|elf|so|dll|deb|rpm|apk|msi|cab|dmg|pkg|snap|appimage)$//I')
 
 # Extract version — try URL path first (covers GitHub/GitLab releases
 # and most CDN layouts), then fall back to filename
@@ -226,7 +226,7 @@ fi
 SCAN_PRODUCT_NAME=$(printf '%s' "${SCAN_PRODUCT_NAME}" | sed 's/[-_.]*$//')
 
 # Strip platform/arch suffixes (e.g., -linux-amd64, -darwin-arm64)
-SCAN_PRODUCT_NAME=$(printf '%s' "${SCAN_PRODUCT_NAME}" | sed 's/[-_]\(linux\|darwin\|windows\|amd64\|arm64\|x86_64\|i386\|x86\).*//I')
+SCAN_PRODUCT_NAME=$(printf '%s' "${SCAN_PRODUCT_NAME}" | sed -E 's/[-_](linux|darwin|windows|amd64|arm64|x86_64|i386|x86).*//I')
 
 if [ -z "${SCAN_PRODUCT_NAME}" ]; then
   SCAN_PRODUCT_NAME="${RAW_FILENAME}"

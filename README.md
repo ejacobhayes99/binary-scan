@@ -7,6 +7,20 @@ for vulnerabilities using [Trivy] and [Syft], uploads results to [DefectDojo]
 and [Dependency Track], and runs the [Policy Gate] policy engine for a
 **PASS/FAIL gate decision** based on scan coverage confidence.
 
+The pipeline is defined entirely by reusable [Templates] — the local
+`.gitlab-ci.yml` is a single `include:` directive:
+
+```yaml
+include:
+  - project: 'develop/templates'
+    ref: main
+    file: 'ci/pipelines/binary-scan.yml'
+```
+
+DefectDojo is the central findings store — Trivy and Dependency Track results
+are reimported on every run with `close_old_findings=true`, so DefectDojo always
+reflects the current state of the artifact.
+
 ----
 
 ## Quick Start
@@ -48,7 +62,25 @@ trigger-binary-scan:
     BINARY_REF: "42:myapp:1.0:myapp-linux-amd64.tar.gz"
 ```
 
-## What Gets Scanned
+## Pipeline Stages
+
+| Stage | Job | What It Does |
+|-------|-----|-------------|
+| **init** | `parse-binary-ref` | Parses `BINARY_REF`, downloads/copies the artifact, unpacks archives, writes `scan.env` dotenv |
+| **scan** | `trivy-binary-scan` | Scans the unpacked binary with [Trivy] for CVEs |
+| **scan** | `syft-binary-sbom` | Generates a CycloneDX SBOM with [Syft] and uploads to [Dependency Track] |
+| **scan** | `sbom-coverage-check` | Evaluates SBOM coverage signal for the coverage guardrail |
+| **upload** | `upload-trivy` | Reimports Trivy results into DefectDojo |
+| **upload** | `sync-dt-to-defectdojo` | Polls DT for analysis, exports FPF findings, uploads to DefectDojo |
+| **upload** | `coverage-summary` | Computes coverage tier from Trivy, SBOM, and file type signals |
+| **upload** | `upload-coverage-summary` | Uploads coverage assessment to DefectDojo as a finding |
+| **report** | `export-findings` | Exports all findings for the product from DefectDojo API |
+| **report** | `generate-report` | Generates an HTML report via DefectDojo's Report Builder |
+| **report** | `enrich-epss` | Enriches findings with EPSS scores from FIRST.org |
+| **report** | `enrich-kev` | Enriches findings with CISA Known Exploited Vulnerabilities data |
+| **policy-gate** | `policy-gate` | Runs Policy Gate policy evaluation including the coverage guardrail |
+
+## Scanner Coverage
 
 | File Type | Trivy CVEs | Syft SBOM | Expected Coverage Tier |
 |---|---|---|---|
@@ -67,17 +99,107 @@ trigger-binary-scan:
 Archives and installer packages are automatically extracted before scanning —
 coverage depends on the contents inside.
 
-## Pipeline Stages
+## Required CI/CD Variables
 
-| Stage | Jobs | What It Does |
-|-------|------|-------------|
-| **init** | `parse-binary-ref` | Parses `BINARY_REF`, downloads/copies the artifact, unpacks archives, writes `scan.env` dotenv for downstream jobs |
-| **scan** | `trivy-binary-scan`, `syft-binary-sbom`, `sbom-coverage-check` | Scans the unpacked binary with Trivy (CVEs) and Syft (SBOM), evaluates SBOM coverage signal |
-| **upload** | `upload-trivy`, `sync-dt-to-defectdojo`, `coverage-summary`, `upload-coverage-summary` | Reimports scan results into DefectDojo; syncs Dependency Track findings; computes and uploads coverage assessment |
-| **report** | `export-findings`, `generate-report`, `enrich-epss`, `enrich-kev` | Exports findings, generates HTML report, enriches with EPSS scores and CISA KEV data (shared templates) |
-| **policy-gate** | `policy-gate` | Runs Policy Gate policy evaluation including the coverage guardrail |
+Configure these in **Settings > CI/CD > Variables**:
 
-## Coverage Guardrail
+| Variable | Required/Optional | Description |
+|----------|------------------|-------------|
+| `BINARY_REF` | Required | Binary to scan (URL, shorthand, or path) |
+| `DEFECTDOJO_URL` | Required | DefectDojo base URL |
+| `DEFECTDOJO_TOKEN` | Required | DefectDojo API token (should be masked) |
+| `DEFECTDOJO_USER` | Required | DefectDojo web UI username for report generation |
+| `DEFECTDOJO_PASS` | Required | DefectDojo web UI password for report generation (should be masked) |
+| `DEPENDENCY_TRACK_URL` | Required | Dependency Track API base URL |
+| `DT_API_TOKEN` | Required | Dependency Track API key (should be masked) |
+| `DEFECTDOJO_PRODUCT_TYPE` | Optional | DefectDojo product type (default: `Research and Development`) |
+| `GITLAB_TOKEN` | Optional | GitLab PAT for private package registry downloads |
+| `POLL_INTERVAL` | Optional | Seconds between Dependency Track polling attempts (default: `5`) |
+| `POLL_MAX_ATTEMPTS` | Optional | Maximum polling attempts before timeout (default: `60`) |
+
+### Policy Gate Variables
+
+Policy Gate variables are set automatically by the pipeline templates. See
+[Policy Gate configuration] for the full list of `POLICY_GATE_*` environment
+variables if you need to override defaults.
+
+## How It Works
+
+### 1. Init
+
+The `parse-binary-ref` job parses the `BINARY_REF` variable to determine the
+input type (URL, GitLab shorthand, or filesystem path), downloads or copies the
+artifact, and unpacks archives if detected. The unpacked workspace and a
+`scan.env` dotenv file are passed as artifacts to all downstream jobs.
+
+**Supported archive formats** are automatically detected by MIME type:
+`.zip`, `.tar.gz`/`.tgz`, `.tar.xz`, `.msi`, `.cab`, `.deb`, `.rpm`,
+`.squashfs` (AppImage/Snap). Single binaries (non-archive) are scanned
+directly without unpacking.
+
+**Archive safety limits:**
+
+| Limit | Value | Reason |
+|-------|-------|--------|
+| Max unpacked size | 2048 MB | Prevents disk exhaustion from decompression bombs |
+| Max file count | 10,000 | Prevents inode exhaustion and excessive scan time |
+| Path traversal | Rejected | Prevents archive entries with `..` from escaping the unpack directory |
+
+### 2. Scan
+
+Three jobs run in parallel:
+
+- **`trivy-binary-scan`** — Runs [Trivy] against the unpacked workspace to
+  detect known CVEs in embedded packages and libraries.
+
+- **`syft-binary-sbom`** — Generates a CycloneDX SBOM with [Syft] and uploads
+  it to [Dependency Track] for component analysis.
+
+- **`sbom-coverage-check`** — Evaluates the SBOM for coverage signal (component
+  count, recognized file types) used by the coverage guardrail.
+
+### 3. Upload
+
+- **`upload-trivy`** — Reimports Trivy results into DefectDojo using the
+  reimport API. `auto_create_context=true` creates the product, engagement,
+  and test if they don't exist. `close_old_findings=true` marks stale findings
+  as inactive.
+
+- **`sync-dt-to-defectdojo`** — Polls Dependency Track until BOM processing and
+  vulnerability analysis complete, exports findings in FPF format, and uploads
+  them to DefectDojo.
+
+- **`coverage-summary`** — Aggregates coverage signals from Trivy (package
+  detection), Syft (SBOM components), and file type recognition into a
+  coverage tier assessment.
+
+- **`upload-coverage-summary`** — Uploads the coverage assessment to DefectDojo
+  as a finding so it is visible in reports and available to Policy Gate.
+
+### 4. Report and Enrichment
+
+Four jobs run in parallel:
+
+- **`export-findings`** — Exports all findings for the product from the
+  DefectDojo REST API with pagination.
+
+- **`generate-report`** — Logs into the DefectDojo web UI and generates an
+  HTML report via the Report Builder.
+
+- **`enrich-epss`** — Downloads current EPSS scores and patches DefectDojo
+  findings with EPSS data for risk-based policy evaluation.
+
+- **`enrich-kev`** — Tags findings that match CISA Known Exploited
+  Vulnerabilities for policy evaluation.
+
+### 5. Policy Gate
+
+The `policy-gate` job runs [Policy Gate] against the product's findings.
+Policy Gate evaluates all Rego policies — including the **coverage guardrail**
+— and produces a PASS/FAIL decision with an HTML report. The job is configured
+with `allow_failure: true` for phased rollout.
+
+### Coverage Guardrail
 
 The pipeline assesses scan coverage across three signals (Trivy package detection,
 SBOM component extraction, file type recognition) and assigns a tier:
@@ -92,58 +214,49 @@ When the pipeline fails with Minimal coverage, see
 [`docs/coverage-guardrail-runbook.md`](docs/coverage-guardrail-runbook.md) for
 remediation options.
 
-## Variables Reference
+## Pipeline Artifacts
 
-Configure these in **Settings > CI/CD > Variables**:
+| Job | Artifact | Description |
+|-----|----------|-------------|
+| `parse-binary-ref` | `scan-workspace/unpacked/` | Unpacked binary workspace |
+| `trivy-binary-scan` | `trivy-results.json` | Raw Trivy scan output |
+| `syft-binary-sbom` | `sbom.cdx.json` | CycloneDX SBOM from Syft |
+| `syft-binary-sbom` | `sbom-meta.json` | SBOM metadata for coverage check |
+| `syft-binary-sbom` | `dt-upload-response.json` | Dependency Track upload response |
+| `sbom-coverage-check` | `dd-sbom-coverage.json` | SBOM coverage signal assessment |
+| `upload-trivy` | `import-response.json` | DefectDojo reimport response |
+| `sync-dt-to-defectdojo` | `dt-findings-fpf.json` | Dependency Track findings in FPF format |
+| `sync-dt-to-defectdojo` | `dt-defectdojo-import-response.json` | DefectDojo reimport response for DT findings |
+| `coverage-summary` | `dd-coverage-summary.json` | Coverage tier assessment |
+| `export-findings` | `findings.json` | All findings for the product from DefectDojo |
+| `generate-report` | `public/report.html` | DefectDojo HTML report (exposed in MR) |
+| `policy-gate` | `output/report.html` | Policy Gate PASS/FAIL policy report |
+| `policy-gate` | `output/decisions.json` | Policy evaluation results |
+| `policy-gate` | `output/findings.json` | Policy Gate-exported findings |
+| `policy-gate` | `output/metrics.txt` | Violation/warning counts |
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `BINARY_REF` | Yes | — | Binary to scan (URL, shorthand, or path) |
-| `DEFECTDOJO_URL` | Yes | `http://defectdojo-docker-nginx-1:8080` | DefectDojo base URL |
-| `DEFECTDOJO_TOKEN` | Yes | — | DefectDojo API token (should be masked) |
-| `DEFECTDOJO_PRODUCT_TYPE` | No | `Research and Development` | DefectDojo product type |
-| `DEPENDENCY_TRACK_URL` | Yes | `http://dtrack-apiserver:8080` | Dependency Track API base URL |
-| `DT_API_TOKEN` | Yes | — | Dependency Track API key (should be masked) |
-| `GITLAB_TOKEN` | No | — | GitLab PAT for private package registry downloads |
-| `POLL_INTERVAL` | No | `5` | Seconds between Dependency Track polling attempts |
-| `POLL_MAX_ATTEMPTS` | No | `60` | Maximum polling attempts before timeout |
+## Project Structure
 
-## Archive Safety Limits
+```
+binary-scan/
+├── .gitlab-ci.yml                          # Single include from templates
+├── docs/
+│   └── coverage-guardrail-runbook.md       # Remediation guide for Minimal coverage
+└── README.md
+```
 
-| Limit | Value | Reason |
-|-------|-------|--------|
-| Max unpacked size | 2048 MB | Prevents disk exhaustion from decompression bombs |
-| Max file count | 10,000 | Prevents inode exhaustion and excessive scan time |
-| Path traversal | Rejected | Prevents archive entries with `..` from escaping the unpack directory |
-
-## Supported Archive Formats
-
-Archives are automatically detected by MIME type and unpacked before scanning:
-
-`.zip`, `.tar.gz`/`.tgz`, `.tar.xz`, `.msi`, `.cab`, `.deb`, `.rpm`, `.squashfs`
-(AppImage/Snap)
-
-Single binaries (non-archive) are scanned directly without unpacking.
-
-## Integration with Existing Platform
-
-Binary Scan uses the same shared templates (`ci/shared.yml`), DefectDojo
-central findings store, Dependency Track SBOM analysis, EPSS/KEV enrichment,
-and Policy Gate evaluation as [Container Scan](../container-scan) and
-[Repo Scan](../repo-scan). Scan results from all three pipelines are
-consolidated in DefectDojo under the same product type, enabling unified
-risk management across container images, source repositories, and binary
-artifacts. Shared templates are maintained in [`../templates`](../templates)
-and policies in [`../policy-gate`](../policy-gate).
-
-## Related Repositories
+Binary Scan uses the same shared templates, DefectDojo central findings store,
+Dependency Track SBOM analysis, EPSS/KEV enrichment, and Policy Gate evaluation
+as [Container Scan](../container-scan) and [Repo Scan](../repo-scan). The
+pipeline definition, scanner configurations, and all shared jobs live in the
+[Templates] project.
 
 | Repository | Role |
 |------------|------|
-| [`templates`](../templates) | Shared CI/CD job templates (`.dd-reimport`, `.export-findings`, `.generate-report`, `.enrich-epss`, `.enrich-kev`, `.policy-gate`) |
-| [`policy-gate`](../policy-gate) | Rego policy engine and HTML report generator |
-| [`container-scan`](../container-scan) | Container image scanning pipeline |
-| [`repo-scan`](../repo-scan) | Source code and dependency scanning pipeline |
+| [Templates] | Shared CI/CD job templates |
+| [Policy Gate] | Rego policy engine and HTML report generator |
+| [Container Scan](../container-scan) | Container image scanning pipeline |
+| [Repo Scan](../repo-scan) | Source code and dependency scanning pipeline |
 
 [Trivy]: https://aquasecurity.github.io/trivy/
 [Syft]: https://github.com/anchore/syft
@@ -151,3 +264,5 @@ and policies in [`../policy-gate`](../policy-gate).
 [Dependency Track]: https://dependencytrack.org/
 [Policy Gate]: https://github.com/ejacobhayes99/policy-gate
 [GitLab CI/CD]: https://docs.gitlab.com/ee/ci/
+[Templates]: https://github.com/ejacobhayes99/templates
+[Policy Gate configuration]: https://github.com/ejacobhayes99/policy-gate/blob/main/docs/CONFIGURATION.md

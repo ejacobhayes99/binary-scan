@@ -229,7 +229,16 @@ SCAN_PRODUCT_NAME=$(printf '%s' "${SCAN_PRODUCT_NAME}" | sed 's/[-_.]*$//')
 SCAN_PRODUCT_NAME=$(printf '%s' "${SCAN_PRODUCT_NAME}" | sed -E 's/[-_](linux|darwin|windows|amd64|arm64|x86_64|i386|x86).*//I')
 
 if [ -z "${SCAN_PRODUCT_NAME}" ]; then
-  SCAN_PRODUCT_NAME="${RAW_FILENAME}"
+  # GitHub/GitLab archive URLs encode the project in the path, not the filename
+  # GitHub:  https://github.com/{owner}/{repo}/archive/...
+  # GitLab:  https://{host}/{group...}/{project}/-/archive/...
+  if printf '%s' "${BINARY_REF}" | grep -qE '^https://github\.com/[^/]+/[^/]+/archive/'; then
+    SCAN_PRODUCT_NAME=$(printf '%s' "${BINARY_REF}" | sed -E 's|^https://github\.com/[^/]+/([^/]+)/archive/.*|\1|')
+  elif printf '%s' "${BINARY_REF}" | grep -qE '^https://.*/-/archive/'; then
+    SCAN_PRODUCT_NAME=$(printf '%s' "${BINARY_REF}" | sed -E 's|^https://.*/([^/]+)/-/archive/.*|\1|')
+  else
+    SCAN_PRODUCT_NAME="${RAW_FILENAME}"
+  fi
 fi
 
 printf '[binary-scan:init] Product: %s, Tag: %s\n' "${SCAN_PRODUCT_NAME}" "${SCAN_TAG}"

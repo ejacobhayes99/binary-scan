@@ -220,7 +220,7 @@ remediation options.
 
 | Job | Artifact | Description |
 |-----|----------|-------------|
-| `parse-binary-ref` | `scan-workspace/unpacked/` | Unpacked binary workspace |
+| `parse-binary-ref` | `scan-workspace/unpacked/` | Unpacked binary workspace (expires after 2 hours) |
 | `trivy-binary-scan` | `trivy-results.json` | Raw Trivy scan output |
 | `syft-binary-sbom` | `sbom.cdx.json` | CycloneDX SBOM from Syft |
 | `syft-binary-sbom` | `sbom-meta.json` | SBOM metadata for coverage check |

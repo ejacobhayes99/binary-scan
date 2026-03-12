@@ -188,11 +188,14 @@ Four jobs run in parallel:
 
 - **`enrich-epss`** — Downloads current EPSS scores and patches DefectDojo
   findings with EPSS data for risk-based policy evaluation. Scoped to the
-  current engagement using the engagement ID from the import response artifact.
+  current engagement using the engagement ID from `import-response.json`.
+  Falls back to product-level scope if the file is missing or lacks an
+  engagement ID.
 
 - **`enrich-kev`** — Tags findings that match CISA Known Exploited
   Vulnerabilities for policy evaluation. Scoped to the current engagement
-  using the engagement ID from the import response artifact.
+  using the engagement ID from `import-response.json`. Falls back to
+  product-level scope if the file is missing or lacks an engagement ID.
 
 ### 5. Policy Gate
 

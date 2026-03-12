@@ -187,10 +187,12 @@ Four jobs run in parallel:
   HTML report via the Report Builder.
 
 - **`enrich-epss`** — Downloads current EPSS scores and patches DefectDojo
-  findings with EPSS data for risk-based policy evaluation.
+  findings with EPSS data for risk-based policy evaluation. Scoped to the
+  current engagement using the engagement ID from the import response artifact.
 
 - **`enrich-kev`** — Tags findings that match CISA Known Exploited
-  Vulnerabilities for policy evaluation.
+  Vulnerabilities for policy evaluation. Scoped to the current engagement
+  using the engagement ID from the import response artifact.
 
 ### 5. Policy Gate
 

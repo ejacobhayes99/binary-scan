@@ -38,7 +38,7 @@ if printf '%s' "${BINARY_REF}" | grep -qE '^https://'; then
   if printf '%s' "${BINARY_REF}" | grep -q '/packages/generic/' && [ -n "${GITLAB_TOKEN:-}" ]; then
     WGET_ARGS="--header=PRIVATE-TOKEN: ${GITLAB_TOKEN}"
   fi
-  if ! wget --timeout=300 --max-redirect=5 ${WGET_ARGS} -O "${DOWNLOAD_PATH}" "${BINARY_REF}"; then
+  if ! wget -T 300 ${WGET_ARGS} -O "${DOWNLOAD_PATH}" "${BINARY_REF}"; then
     printf '[binary-scan:init] ERROR: Failed to download %s\n' "${BINARY_REF}"
     exit 1
   fi
@@ -62,7 +62,7 @@ elif printf '%s' "${BINARY_REF}" | grep -qE '^[0-9]+:[^:]+:[^:]+:[^:]+$'; then
 
   DOWNLOAD_URL="${CI_SERVER_URL}/api/v4/projects/${PROJECT_ID}/packages/generic/${PACKAGE}/${VERSION}/${FILENAME}"
   printf '[binary-scan:init] Downloading from GitLab package registry: %s\n' "${DOWNLOAD_URL}"
-  if ! wget --timeout=300 --max-redirect=5 --header="PRIVATE-TOKEN: ${CI_JOB_TOKEN}" -O "${DOWNLOAD_PATH}" "${DOWNLOAD_URL}"; then
+  if ! wget -T 300 --header="PRIVATE-TOKEN: ${CI_JOB_TOKEN}" -O "${DOWNLOAD_PATH}" "${DOWNLOAD_URL}"; then
     printf '[binary-scan:init] ERROR: Failed to download package %s\n' "${BINARY_REF}"
     exit 1
   fi

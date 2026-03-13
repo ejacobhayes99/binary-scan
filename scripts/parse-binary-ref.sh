@@ -38,7 +38,7 @@ if printf '%s' "${BINARY_REF}" | grep -qE '^https://'; then
   if printf '%s' "${BINARY_REF}" | grep -q '/packages/generic/' && [ -n "${GITLAB_TOKEN:-}" ]; then
     WGET_ARGS="--header=PRIVATE-TOKEN: ${GITLAB_TOKEN}"
   fi
-  if ! wget ${WGET_ARGS} -O "${DOWNLOAD_PATH}" "${BINARY_REF}"; then
+  if ! wget --timeout=300 --max-redirect=5 ${WGET_ARGS} -O "${DOWNLOAD_PATH}" "${BINARY_REF}"; then
     printf '[binary-scan:init] ERROR: Failed to download %s\n' "${BINARY_REF}"
     exit 1
   fi
@@ -50,9 +50,19 @@ elif printf '%s' "${BINARY_REF}" | grep -qE '^[0-9]+:[^:]+:[^:]+:[^:]+$'; then
   VERSION=$(printf '%s' "${BINARY_REF}" | cut -d: -f3)
   FILENAME=$(printf '%s' "${BINARY_REF}" | cut -d: -f4)
 
+  # Validate shorthand fields: alphanumerics, hyphens, dots, underscores only
+  for field_name in PACKAGE VERSION FILENAME; do
+    eval field_val="\${${field_name}}"
+    if printf '%s' "${field_val}" | grep -qE '[^a-zA-Z0-9._-]'; then
+      printf '[binary-scan:init] ERROR: %s contains invalid characters: %s\n' "${field_name}" "${field_val}"
+      printf 'Allowed: alphanumerics, hyphens, dots, underscores\n'
+      exit 1
+    fi
+  done
+
   DOWNLOAD_URL="${CI_SERVER_URL}/api/v4/projects/${PROJECT_ID}/packages/generic/${PACKAGE}/${VERSION}/${FILENAME}"
   printf '[binary-scan:init] Downloading from GitLab package registry: %s\n' "${DOWNLOAD_URL}"
-  if ! wget --header="PRIVATE-TOKEN: ${CI_JOB_TOKEN}" -O "${DOWNLOAD_PATH}" "${DOWNLOAD_URL}"; then
+  if ! wget --timeout=300 --max-redirect=5 --header="PRIVATE-TOKEN: ${CI_JOB_TOKEN}" -O "${DOWNLOAD_PATH}" "${DOWNLOAD_URL}"; then
     printf '[binary-scan:init] ERROR: Failed to download package %s\n' "${BINARY_REF}"
     exit 1
   fi
@@ -75,7 +85,15 @@ else
   exit 1
 fi
 
-printf '[binary-scan:init] Downloaded %s bytes\n' "$(wc -c < "${DOWNLOAD_PATH}")"
+DOWNLOAD_SIZE=$(wc -c < "${DOWNLOAD_PATH}")
+printf '[binary-scan:init] Downloaded %s bytes\n' "${DOWNLOAD_SIZE}"
+
+MAX_DOWNLOAD_MB=1024
+DOWNLOAD_MB=$((DOWNLOAD_SIZE / 1048576))
+if [ "${DOWNLOAD_MB}" -gt "${MAX_DOWNLOAD_MB}" ]; then
+  printf '[binary-scan:init] ERROR: Download size %s MB exceeds limit of %s MB\n' "${DOWNLOAD_MB}" "${MAX_DOWNLOAD_MB}"
+  exit 1
+fi
 
 # ── Archive handling ──────────────────────────
 MIME_TYPE=$(file --mime-type -b "${DOWNLOAD_PATH}")
@@ -83,25 +101,22 @@ printf '[binary-scan:init] Detected MIME type: %s\n' "${MIME_TYPE}"
 
 case "${MIME_TYPE}" in
   application/zip)
-    # Path traversal check
-    if unzip -l "${DOWNLOAD_PATH}" | grep -q '\.\.'; then
-      printf '[binary-scan:init] ERROR: Archive contains path traversal (..)\n'
+    if unzip -l "${DOWNLOAD_PATH}" | awk 'NR>3{print $4}' | grep -qE '(^|/)\.\./|^/'; then
+      printf '[binary-scan:init] ERROR: Archive contains path traversal or absolute paths\n'
       exit 1
     fi
     unzip -o "${DOWNLOAD_PATH}" -d "${UNPACK_DIR}"
     ;;
   application/gzip|application/x-tar)
-    # Path traversal check
-    if tar -tf "${DOWNLOAD_PATH}" | grep -q '\.\.'; then
-      printf '[binary-scan:init] ERROR: Archive contains path traversal (..)\n'
+    if tar -tf "${DOWNLOAD_PATH}" | grep -qE '(^|/)\.\./|^\./\.\./|^/'; then
+      printf '[binary-scan:init] ERROR: Archive contains path traversal or absolute paths\n'
       exit 1
     fi
     tar xzf "${DOWNLOAD_PATH}" -C "${UNPACK_DIR}"
     ;;
   application/x-xz)
-    # Path traversal check
-    if tar -tf "${DOWNLOAD_PATH}" | grep -q '\.\.'; then
-      printf '[binary-scan:init] ERROR: Archive contains path traversal (..)\n'
+    if tar -tf "${DOWNLOAD_PATH}" | grep -qE '(^|/)\.\./|^\./\.\./|^/'; then
+      printf '[binary-scan:init] ERROR: Archive contains path traversal or absolute paths\n'
       exit 1
     fi
     tar xJf "${DOWNLOAD_PATH}" -C "${UNPACK_DIR}"
@@ -210,11 +225,14 @@ fi
 
 # Derive product name: strip from the first version match onward,
 # then strip trailing separators and platform suffixes
+# Escape SCAN_TAG for use in sed (dots, etc. are regex metacharacters)
+SCAN_TAG_ESC=$(printf '%s' "${SCAN_TAG}" | sed 's/[.[\*^$/]/\\&/g')
+
 if [ -n "${SCAN_TAG}" ]; then
-  SCAN_PRODUCT_NAME=$(printf '%s' "${STRIPPED}" | sed "s/[-_.]${SCAN_TAG}.*//")
+  SCAN_PRODUCT_NAME=$(printf '%s' "${STRIPPED}" | sed "s/[-_.]${SCAN_TAG_ESC}.*//")
   # Also try without separator if the above didn't strip anything
   if [ "${SCAN_PRODUCT_NAME}" = "${STRIPPED}" ]; then
-    SCAN_PRODUCT_NAME=$(printf '%s' "${STRIPPED}" | sed "s/${SCAN_TAG}.*//")
+    SCAN_PRODUCT_NAME=$(printf '%s' "${STRIPPED}" | sed "s/${SCAN_TAG_ESC}.*//")
   fi
 else
   # No version found — use SHA-256 of the file as the tag
@@ -243,7 +261,18 @@ fi
 
 printf '[binary-scan:init] Product: %s, Tag: %s\n' "${SCAN_PRODUCT_NAME}" "${SCAN_TAG}"
 
-# ── Write dotenv ──────────────────────────────
+# ── Sanitize and write dotenv ─────────────────
+# Strip characters unsafe for unquoted dotenv values
+SCAN_PRODUCT_NAME=$(printf '%s' "${SCAN_PRODUCT_NAME}" | tr -cd 'a-zA-Z0-9._-')
+SCAN_TAG=$(printf '%s' "${SCAN_TAG}" | tr -cd 'a-zA-Z0-9._-')
+
+if [ -z "${SCAN_PRODUCT_NAME}" ]; then
+  SCAN_PRODUCT_NAME="unknown"
+fi
+if [ -z "${SCAN_TAG}" ]; then
+  SCAN_TAG="unknown"
+fi
+
 {
   printf 'SCAN_PRODUCT_NAME=%s\n' "${SCAN_PRODUCT_NAME}"
   printf 'SCAN_TAG=%s\n' "${SCAN_TAG}"

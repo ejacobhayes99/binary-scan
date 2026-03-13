@@ -39,6 +39,14 @@ BINARY_REF=42:myapp:1.0:myapp-linux-amd64.tar.gz
 BINARY_REF=/mnt/scan-inbox/firmware-v3.bin
 ```
 
+**Input constraints:**
+
+| Format | Constraint |
+|--------|-----------|
+| HTTPS URL | Must start with `https://`. Downloads are limited to 1 GB with a 5-minute timeout and at most 5 redirects. If the URL points at a private GitLab package registry, set `GITLAB_TOKEN`. |
+| GitLab shorthand | Fields (package, version, filename) may only contain alphanumerics, hyphens, dots, and underscores. |
+| Filesystem path | Must be an absolute path starting with `/`. |
+
 **Trigger via GitLab UI:** Go to **Build > Pipelines > Run Pipeline**, add
 variable `BINARY_REF` with one of the formats above.
 
@@ -141,9 +149,10 @@ directly without unpacking.
 
 | Limit | Value | Reason |
 |-------|-------|--------|
+| Max download size | 1024 MB | Rejects oversized downloads before extraction |
 | Max unpacked size | 2048 MB | Prevents disk exhaustion from decompression bombs |
 | Max file count | 10,000 | Prevents inode exhaustion and excessive scan time |
-| Path traversal | Rejected | Prevents archive entries with `..` from escaping the unpack directory |
+| Path traversal | Rejected | Rejects archive entries containing `../` or absolute paths |
 
 ### 2. Scan
 

@@ -162,7 +162,7 @@ if __name__ == "__main__":
 #
 # sbom-coverage-check:
 #   stage: scan   # NOTE: runs in scan stage, not upload — Prompt 5 consumes this artifact
-#   image: python:3.11-alpine
+#   image: python:3.14-alpine
 #   needs:
 #     - job: syft-binary-sbom
 #       artifacts: true

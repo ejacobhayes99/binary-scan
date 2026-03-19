@@ -370,7 +370,7 @@ if __name__ == "__main__":
 #
 # coverage-summary:
 #   stage: upload   # runs after scan jobs, before DD upload
-#   image: python:3.11-alpine
+#   image: python:3.14-alpine
 #   needs:
 #     - job: parse-binary-ref
 #       artifacts: true

@@ -3,9 +3,14 @@
 ## What Happened
 
 The binary-scan pipeline scanned a binary artifact and determined that its
-scanning tools had near-zero visibility into the binary's contents. The
+CVE scanning tools had near-zero visibility into the binary's contents. The
 policy engine failed the pipeline to prevent an unassessed binary from
 being treated as secure.
+
+Note that ClamAV malware scanning still ran successfully even at Minimal
+coverage. The guardrail specifically reflects CVE/SBOM scanner visibility —
+ClamAV provides an independent malware detection signal regardless of
+coverage tier.
 
 ## How to Identify This Failure
 
@@ -102,6 +107,14 @@ A: The thresholds are in `scripts/coverage-summary.py` (tier computation)
 and `scripts/sbom-coverage-to-dd.py` (SBOM component count thresholds of
 0/5/6+). Adjust these if your organization has different risk tolerance,
 but document the change and the rationale.
+
+**Q: If coverage is Minimal, was the binary scanned for anything at all?**
+
+A: Yes. ClamAV malware scanning runs unconditionally and checks the artifact
+against its full virus signature database. A Minimal coverage tier means CVE
+scanners (Trivy, Syft) couldn't identify components — it does not mean the
+binary was completely unexamined. Check the `clamav-scan` job output to
+confirm the malware scan completed.
 
 **Q: Does this affect container-scan or repo-scan?**
 
